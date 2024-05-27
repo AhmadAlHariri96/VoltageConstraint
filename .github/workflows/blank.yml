@@ -1,0 +1,107 @@
+import logging
+import pandas as pd
+import pyomo.environ as po
+import matplotlib.pyplot as plt
+from oemof import solph
+
+from oemof.solph import Bus, EnergySystem, Flow, Model, processing, views
+from oemof.solph import components as cmp
+
+def run_voltage_current_constraints_example(solver="cbc", nologg=False):
+    if not nologg:
+        logging.basicConfig(level=logging.INFO)
+    
+    # Definition der Spannungsgrenzen
+    min_vm_pu = 0.9
+    max_vm_pu = 1.1
+
+    # Erstellung des Energiesystems
+    es = EnergySystem(timeindex=pd.date_range("1/1/2024", periods=5, freq="H"))
+
+    # Definieren der Busse
+    b_el = Bus(label="b_el")
+    es.add(b_el)
+
+    # Definieren der Komponenten (Quelle und Senke)
+    source_el = cmp.Source(
+        label="source_el",
+        outputs={b_el: Flow(nominal_value=50, variable_costs=25, min=[0.2]*5, max=[1.0]*5)}
+    )
+    sink_el = cmp.Sink(
+        label="sink_el",
+        inputs={b_el: Flow(nominal_value=40, fix=[0.5, 0.4, 0.3, 1.0, 0.8])}
+    )
+    es.add(source_el, sink_el)
+
+    # Debugging-Ausgaben
+    print("Energy System Components:")
+    for comp in es.nodes:
+        print(comp.label)
+
+    # Erstellen des Modells
+    om = solph.Model(energysystem=es)
+
+    # Hinzufügen eines benutzerdefinierten Blocks
+    myblock = po.Block()
+
+    # Definieren der Sets für Spannungsgrenzen
+    myblock.VOLTAGEFLOWS = po.Set(
+        initialize=[
+            k for (k, v) in om.flows.items() if v.nominal_value is not None
+        ]
+    )
+
+    # Hinzufügen des benutzerdefinierten Blocks zum Modell
+    om.add_component("MyBlock", myblock)
+
+    # Regel zur Überprüfung der Spannungsgrenzen
+    def voltage_constraint_rule(m, s, e, p, t):
+        return om.flow[s, e, p, t] >= om.flows[s, e].min[t] * om.flows[s, e].nominal_value
+
+    myblock.voltage_constraint = po.Constraint(
+        myblock.VOLTAGEFLOWS, om.TIMEINDEX, rule=voltage_constraint_rule
+    )
+
+    # Regel zur Überprüfung der maximalen Stromstärke
+    def current_constraint_rule(m, s, e, p, t):
+        return om.flow[s, e, p, t] <= om.flows[s, e].max[t] * om.flows[s, e].nominal_value
+
+    myblock.current_constraint = po.Constraint(
+        myblock.VOLTAGEFLOWS, om.TIMEINDEX, rule=current_constraint_rule
+    )
+
+    # Lösen des Modells
+    om.solve(solver=solver, solve_kwargs={"tee": True})
+    logging.info("Optimization successful...")
+
+    # Ergebnisse extrahieren
+    results = solph.processing.results(om)
+
+    # Debugging: Überprüfen, ob die Flüsse vorhanden sind
+    print("Available keys in the results:")
+    print(results.keys())
+
+    # Extrahieren und Plotten der Ergebnisse
+    data = views.node(results, 'b_el')['sequences']
+
+    fig, ax1 = plt.subplots()
+
+    if ('source_el', 'b_el') in data.columns:
+        ax1.plot(data[('source_el', 'b_el')], label='source_el to b_el', drawstyle="steps-post")
+    else:
+        print("Key ('source_el', 'b_el') not found in the results")
+
+    if ('b_el', 'sink_el') in data.columns:
+        ax1.plot(data[('b_el', 'sink_el')], label='b_el to sink_el', drawstyle="steps-post")
+    else:
+        print("Key ('b_el', 'sink_el') not found in the results")
+
+    ax1.set_xlabel("Time")
+    ax1.set_ylabel("Flow (MW)")
+    ax1.legend(loc='best')
+    ax1.grid()
+
+    plt.show()
+
+if __name__ == "__main__":
+    run_voltage_current_constraints_example()
